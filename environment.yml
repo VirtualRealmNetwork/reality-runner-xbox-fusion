@@ -1,0 +1,9 @@
+name: controller-fusion
+channels:
+  - conda-forge
+dependencies:
+  - python=3.12
+  - pip
+  - pip:
+      - evdev==1.9.3
+      - pyudev==0.24.4
