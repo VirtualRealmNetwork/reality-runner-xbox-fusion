@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import selectors
 import signal
 import sys
@@ -516,6 +517,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--debug", action="store_true", help="Print normalized source and fused left-stick values.")
     parser.add_argument("--debug-hz", type=float, default=10.0, help="Maximum debug print frequency.")
     parser.add_argument("--print-devices", action="store_true", help="List joystick-capable devices and exit.")
+    parser.add_argument("--print-selection-json", action="store_true", help="Resolve Controller A and B and print the selected device metadata as JSON.")
     parser.add_argument("--virtual-name", default="Controller Fusion Prototype", help="Name of the virtual controller.")
     parser.add_argument("--virtual-vendor", type=_parse_int, default=DEFAULT_VIRTUAL_VENDOR, help="Virtual controller vendor ID, for example 0xF155.")
     parser.add_argument("--virtual-product", type=_parse_int, default=DEFAULT_VIRTUAL_PRODUCT, help="Virtual controller product ID, for example 0x0001.")
@@ -525,6 +527,16 @@ def parse_args() -> argparse.Namespace:
 def main() -> int:
     args = parse_args()
     devices = enumerate_gamepads()
+    selector_a = SelectorSpec(
+        event_path=args.a_event,
+        uniq=args.a_uniq,
+        name=args.a_name,
+    )
+    selector_b = SelectorSpec(
+        event_path=args.b_event,
+        uniq=args.b_uniq,
+        name=args.b_name,
+    )
     if args.print_devices:
         if not devices:
             print("No joystick-capable input devices were found.")
@@ -539,6 +551,34 @@ def main() -> int:
                 labels.append("default-B")
             suffix = f" [{', '.join(labels)}]" if labels else ""
             print(f"{device.label()}{suffix}")
+        return 0
+    if args.print_selection_json:
+        if not devices:
+            print("No joystick-capable input devices were found.", file=sys.stderr)
+            return 1
+        summary_a = resolve_device(devices, selector_a, "a")
+        summary_b = resolve_device(devices, selector_b, "b")
+        if summary_a.event_path == summary_b.event_path:
+            print("Controller A and Controller B resolved to the same device.", file=sys.stderr)
+            return 1
+        print(
+            json.dumps(
+                {
+                    "a": {
+                        "event_path": summary_a.event_path,
+                        "js_path": summary_a.js_path,
+                        "name": summary_a.name,
+                        "uniq": summary_a.uniq,
+                    },
+                    "b": {
+                        "event_path": summary_b.event_path,
+                        "js_path": summary_b.js_path,
+                        "name": summary_b.name,
+                        "uniq": summary_b.uniq,
+                    },
+                }
+            )
+        )
         return 0
 
     runtime: FusionRuntime | None = None

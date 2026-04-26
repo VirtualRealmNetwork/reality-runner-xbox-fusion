@@ -213,10 +213,11 @@ The Steam helper starts the fusion runtime with `--grab both`, waits briefly for
 
 Why this helper exists:
 
-- plain `--grab both` is not enough to hide the original Bluetooth controllers from Steam
+- plain `--grab both` is not enough to hide the original Bluetooth controllers from every consumer
 - Steam can still enumerate the physical pads through other interfaces
 - that can leave the fused controller in a later slot instead of the first one
-- `./run_fusion_and_steam.sh` fixes that by making Steam see only the virtual controller
+- `./run_fusion_and_steam.sh` fixes the normal Steam controller path by making SDL see only the virtual controller
+- SteamVR and ALVR may still enumerate the physical source devices separately; that path is not fully hidden by the current helper
 
 ## Live Validation
 
