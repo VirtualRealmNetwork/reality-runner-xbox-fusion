@@ -22,10 +22,16 @@ from fusion_common import (
 
 
 LEFT_STICK_CODES = {ecodes.ABS_X, ecodes.ABS_Y}
-ONE_SIDED_ABS_CODES = {ecodes.ABS_GAS, ecodes.ABS_BRAKE}
+ONE_SIDED_ABS_CODES = {ecodes.ABS_Z, ecodes.ABS_RZ, ecodes.ABS_GAS, ecodes.ABS_BRAKE}
 DEFAULT_DEADZONE = 0.18
 DEFAULT_VIRTUAL_VENDOR = 0xF155
 DEFAULT_VIRTUAL_PRODUCT = 0x0001
+TOGGLE_TRIGGER_THRESHOLD = 0.75
+TOGGLE_LEFT_TRIGGER_AXES = (ecodes.ABS_Z,)
+TOGGLE_RIGHT_TRIGGER_AXES = (ecodes.ABS_RZ,)
+TOGGLE_LEFT_TRIGGER_KEYS = (ecodes.BTN_TL2,)
+TOGGLE_RIGHT_TRIGGER_KEYS = (ecodes.BTN_TR2,)
+TOGGLE_STICK_KEYS = (ecodes.BTN_THUMBL, ecodes.BTN_THUMBR)
 
 
 @dataclass
@@ -51,6 +57,8 @@ class FusionRuntime:
         self.selector = selectors.DefaultSelector()
         self.sources: dict[str, SourceState] = {}
         self.selected: dict[str, object] = {}
+        self.fusion_enabled = True
+        self.toggle_chord_was_down = False
         self._setup()
 
     def _setup(self) -> None:
@@ -78,6 +86,7 @@ class FusionRuntime:
             "a": self._open_source(summary_a.event_path),
             "b": self._open_source(summary_b.event_path),
         }
+        self.toggle_chord_was_down = self._toggle_chord_down()
         self.output_absinfo = self._build_output_absinfo()
 
         if not self.args.dry_run:
@@ -205,7 +214,7 @@ class FusionRuntime:
             if merged is not None:
                 self._write_output(ecodes.EV_ABS, abs_code, merged)
 
-        self._write_fused_left_stick()
+        self._write_left_stick()
         if self.ui:
             self.ui.syn()
 
@@ -215,12 +224,17 @@ class FusionRuntime:
             codes.update(source.key_values)
         return codes
 
+    def _output_sources(self) -> tuple[SourceState, ...]:
+        if self.fusion_enabled:
+            return tuple(self.sources.values())
+        return (self.sources["a"],)
+
     def _merged_key_value(self, code: int) -> int:
-        return 1 if any(source.key_values.get(code, 0) for source in self.sources.values()) else 0
+        return 1 if any(source.key_values.get(code, 0) for source in self._output_sources()) else 0
 
     def _merged_abs_value(self, code: int) -> int | None:
         candidates: list[tuple[int, int]] = []
-        for source in self.sources.values():
+        for source in self._output_sources():
             if code in source.abs_values:
                 candidates.append((source.abs_values[code], source.abs_seq.get(code, 0)))
         if not candidates:
@@ -232,6 +246,12 @@ class FusionRuntime:
             return max(candidates, key=lambda item: (item[0], item[1]))[0]
         return max(candidates, key=lambda item: (abs(item[0] - center), item[1]))[0]
 
+    def _neutral_abs_value(self, code: int) -> int:
+        info = self.output_absinfo[code]
+        if code in ONE_SIDED_ABS_CODES:
+            return info.min
+        return int(center_for(info))
+
     def _normalized_left(self, which: str) -> tuple[float, float]:
         source = self.sources[which]
         abs_x = source.device.absinfo(ecodes.ABS_X)
@@ -241,6 +261,24 @@ class FusionRuntime:
         from fusion_common import normalize_axis
 
         return normalize_axis(value_x, abs_x), normalize_axis(value_y, abs_y)
+
+    def _write_left_stick(self) -> bool:
+        if not self.fusion_enabled:
+            return self._write_controller_a_left_stick()
+        return self._write_fused_left_stick()
+
+    def _write_controller_a_left_stick(self) -> bool:
+        a_x, a_y = self._normalized_left("a")
+        raw_x = denormalize_axis(a_x, self.output_absinfo[ecodes.ABS_X])
+        raw_y = denormalize_axis(a_y, self.output_absinfo[ecodes.ABS_Y])
+        changed = False
+        changed |= self._write_output(ecodes.EV_ABS, ecodes.ABS_X, raw_x)
+        changed |= self._write_output(ecodes.EV_ABS, ecodes.ABS_Y, raw_y)
+
+        if self.args.debug and (changed or time.monotonic() - self.last_debug_at >= self.debug_interval):
+            self.last_debug_at = time.monotonic()
+            print(f"A=({a_x:+.3f},{a_y:+.3f}) fusion=off", flush=True)
+        return changed
 
     def _write_fused_left_stick(self) -> bool:
         a_x, a_y = self._normalized_left("a")
@@ -274,6 +312,63 @@ class FusionRuntime:
             )
         return changed
 
+    def _trigger_axis_active(self, source: SourceState, codes: tuple[int, ...]) -> bool:
+        for code in codes:
+            if code not in source.abs_values:
+                continue
+            info = source.device.absinfo(code)
+            span = info.max - info.min
+            if span <= 0:
+                continue
+            normalized = (source.abs_values[code] - info.min) / span
+            if normalized >= TOGGLE_TRIGGER_THRESHOLD:
+                return True
+        return False
+
+    def _trigger_key_active(self, source: SourceState, codes: tuple[int, ...]) -> bool:
+        return any(source.key_values.get(code, 0) for code in codes)
+
+    def _toggle_chord_down(self) -> bool:
+        source = self.sources.get("a")
+        if not source:
+            return False
+
+        left_trigger = self._trigger_axis_active(source, TOGGLE_LEFT_TRIGGER_AXES) or self._trigger_key_active(
+            source, TOGGLE_LEFT_TRIGGER_KEYS
+        )
+        right_trigger = self._trigger_axis_active(source, TOGGLE_RIGHT_TRIGGER_AXES) or self._trigger_key_active(
+            source, TOGGLE_RIGHT_TRIGGER_KEYS
+        )
+        sticks = all(source.key_values.get(code, 0) for code in TOGGLE_STICK_KEYS)
+        return left_trigger and right_trigger and sticks
+
+    def _refresh_toggle_state(self) -> bool:
+        chord_down = self._toggle_chord_down()
+        changed = False
+        if chord_down and not self.toggle_chord_was_down:
+            self.fusion_enabled = not self.fusion_enabled
+            print(f"Fusion mode: {'ON' if self.fusion_enabled else 'OFF'}", flush=True)
+            changed = self._rerender_output()
+        self.toggle_chord_was_down = chord_down
+        return changed
+
+    def _rerender_output(self) -> bool:
+        changed = False
+        for key_code in self._all_key_codes():
+            changed |= self._write_output(ecodes.EV_KEY, key_code, self._merged_key_value(key_code))
+
+        for abs_code in self.output_absinfo:
+            if abs_code in LEFT_STICK_CODES:
+                continue
+            merged = self._merged_abs_value(abs_code)
+            if merged is not None:
+                changed |= self._write_output(ecodes.EV_ABS, abs_code, merged)
+            elif not self.fusion_enabled:
+                changed |= self._write_output(ecodes.EV_ABS, abs_code, self._neutral_abs_value(abs_code))
+
+        changed |= self._write_left_stick()
+        return changed
+
     def _write_output(self, event_type: int, code: int, value: int) -> bool:
         key = (event_type, code)
         if self.output_values.get(key) == value:
@@ -289,18 +384,20 @@ class FusionRuntime:
 
         if event.type == ecodes.EV_KEY:
             source.key_values[event.code] = int(event.value)
+            toggle_changed = self._refresh_toggle_state() if source_name == "a" else False
             merged = self._merged_key_value(event.code)
-            return self._write_output(ecodes.EV_KEY, event.code, merged)
+            return toggle_changed | self._write_output(ecodes.EV_KEY, event.code, merged)
 
         if event.type == ecodes.EV_ABS:
             source.abs_values[event.code] = int(event.value)
             source.abs_seq[event.code] = self.sequence
+            toggle_changed = self._refresh_toggle_state() if source_name == "a" else False
             if event.code in LEFT_STICK_CODES:
-                return self._write_fused_left_stick()
+                return toggle_changed | self._write_left_stick()
             merged = self._merged_abs_value(event.code)
             if merged is None:
-                return False
-            return self._write_output(ecodes.EV_ABS, event.code, merged)
+                return toggle_changed
+            return toggle_changed | self._write_output(ecodes.EV_ABS, event.code, merged)
 
         return False
 
@@ -371,6 +468,8 @@ class FusionRuntime:
             else:
                 print("Force feedback target: unavailable on Controller A", flush=True)
         print(f"Grab mode: {self.args.grab}", flush=True)
+        print("Fusion mode: ON", flush=True)
+        print("Toggle binding: LT + RT + LS + RS on Controller A", flush=True)
 
     def close(self) -> None:
         if self.ui:

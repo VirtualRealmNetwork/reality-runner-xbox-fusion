@@ -13,6 +13,7 @@ Fusion rule:
 - left-stick magnitude/intensity comes from Controller B
 - every non-left-stick input is forwarded into the virtual controller
 - force feedback from the virtual controller is forwarded to Controller A
+- fusion starts enabled and can be toggled with `LT + RT + LS + RS` on Controller A
 
 The implementation targets Linux input devices through `evdev` and creates the fused controller through `/dev/uinput`.
 
@@ -45,6 +46,16 @@ Current fallback behavior:
 
 - if B is centered, fused output is centered
 - if A is centered but B is nonzero, fused output points forward
+
+Runtime toggle:
+
+- default startup state is fusion on
+- press `LT + RT + LS + RS` on Controller A to switch between fusion and Controller A only
+- when fusion is off, the virtual controller outputs Controller A's controls only
+- each switch prints `Fusion mode: ON` or `Fusion mode: OFF` in the console
+- `LS` and `RS` mean pressing the left and right stick buttons
+
+The current binding is intentionally explicit, but it is not especially comfortable. A practical alternative for later would be `Back/View + Start/Menu + LS`, which is rarer during gameplay and easier to press without holding both triggers.
 
 The virtual device is created with a distinct name:
 
