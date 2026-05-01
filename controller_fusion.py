@@ -2,13 +2,17 @@
 from __future__ import annotations
 
 import argparse
+import errno
 import json
+import os
 import selectors
 import signal
 import sys
 import time
+import traceback
 from dataclasses import dataclass, field
 
+import pyudev
 from evdev import AbsInfo, InputDevice, UInput, ecodes
 
 from fusion_common import (
@@ -23,13 +27,14 @@ from fusion_common import (
 
 
 LEFT_STICK_CODES = {ecodes.ABS_X, ecodes.ABS_Y}
-ONE_SIDED_ABS_CODES = {ecodes.ABS_Z, ecodes.ABS_RZ, ecodes.ABS_GAS, ecodes.ABS_BRAKE}
+ONE_SIDED_ABS_CODES = {ecodes.ABS_GAS, ecodes.ABS_BRAKE}
 DEFAULT_DEADZONE = 0.18
 DEFAULT_VIRTUAL_VENDOR = 0xF155
 DEFAULT_VIRTUAL_PRODUCT = 0x0001
+DEFAULT_STARTUP_WAIT_SECONDS = 30.0
 TOGGLE_TRIGGER_THRESHOLD = 0.75
-TOGGLE_LEFT_TRIGGER_AXES = (ecodes.ABS_Z,)
-TOGGLE_RIGHT_TRIGGER_AXES = (ecodes.ABS_RZ,)
+TOGGLE_LEFT_TRIGGER_AXES = (ecodes.ABS_BRAKE, ecodes.ABS_Z)
+TOGGLE_RIGHT_TRIGGER_AXES = (ecodes.ABS_GAS, ecodes.ABS_RZ)
 TOGGLE_LEFT_TRIGGER_KEYS = (ecodes.BTN_TL2,)
 TOGGLE_RIGHT_TRIGGER_KEYS = (ecodes.BTN_TR2,)
 TOGGLE_STICK_KEYS = (ecodes.BTN_THUMBL, ecodes.BTN_THUMBR)
@@ -38,9 +43,12 @@ TOGGLE_STICK_KEYS = (ecodes.BTN_THUMBL, ecodes.BTN_THUMBR)
 @dataclass
 class SourceState:
     device: InputDevice
+    event_path: str
+    abs_info: dict[int, AbsInfo] = field(default_factory=dict)
     abs_values: dict[int, int] = field(default_factory=dict)
     abs_seq: dict[int, int] = field(default_factory=dict)
     key_values: dict[int, int] = field(default_factory=dict)
+    connected: bool = True
 
 
 class FusionRuntime:
@@ -58,15 +66,20 @@ class FusionRuntime:
         self.selector = selectors.DefaultSelector()
         self.sources: dict[str, SourceState] = {}
         self.selected: dict[str, object] = {}
+        self.source_selectors: dict[str, SelectorSpec] = {}
+        self.reconnect_selectors: dict[str, SelectorSpec] = {}
+        self.reconnect_after: dict[str, float] = {}
+        self.next_presence_check = 0.0
+        self.udev_context: pyudev.Context | None = None
+        self.udev_monitor: pyudev.Monitor | None = None
         self.fusion_enabled = True
         self.toggle_chord_was_down = False
+        self.toggle_debug_last = ""
+        self.toggle_left_trigger_axes: tuple[int, ...] = ()
+        self.toggle_right_trigger_axes: tuple[int, ...] = ()
         self._setup()
 
     def _setup(self) -> None:
-        devices = enumerate_gamepads()
-        if not devices:
-            raise RuntimeError("No joystick-capable input devices were found.")
-
         selector_a = SelectorSpec(
             event_path=self.args.a_event,
             uniq=self.args.a_uniq,
@@ -77,16 +90,19 @@ class FusionRuntime:
             uniq=self.args.b_uniq,
             name=self.args.b_name,
         )
-        summary_a = resolve_device(devices, selector_a, "a")
-        summary_b = resolve_device(devices, selector_b, "b")
-        if summary_a.event_path == summary_b.event_path:
-            raise RuntimeError("Controller A and Controller B resolved to the same device.")
+        self.source_selectors = {"a": selector_a, "b": selector_b}
+        summary_a, summary_b = self._resolve_startup_devices(selector_a, selector_b)
 
         self.selected = {"a": summary_a, "b": summary_b}
-        self.sources = {
-            "a": self._open_source(summary_a.event_path),
-            "b": self._open_source(summary_b.event_path),
+        self.reconnect_selectors = {
+            "a": self._build_reconnect_selector(selector_a, summary_a),
+            "b": self._build_reconnect_selector(selector_b, summary_b),
         }
+        self.sources = {
+            "a": self._open_source(summary_a.event_path, "a"),
+            "b": self._open_source(summary_b.event_path, "b"),
+        }
+        self._select_toggle_trigger_axes()
         self.toggle_chord_was_down = self._toggle_chord_down()
         self.output_absinfo = self._build_output_absinfo()
 
@@ -105,7 +121,37 @@ class FusionRuntime:
             self.selector.register(self.ui, selectors.EVENT_READ, "ui")
             self._initialize_output()
 
+        self._setup_udev_monitor()
         self._install_signal_handlers()
+
+    def _resolve_startup_devices(self, selector_a: SelectorSpec, selector_b: SelectorSpec):
+        deadline = time.monotonic() + self.args.startup_wait
+        last_error: Exception | None = None
+
+        while True:
+            try:
+                devices = enumerate_gamepads()
+                if not devices:
+                    raise RuntimeError("No joystick-capable input devices were found.")
+
+                summary_a = resolve_device(devices, selector_a, "a")
+                summary_b = resolve_device(devices, selector_b, "b")
+                if summary_a.event_path == summary_b.event_path:
+                    raise RuntimeError("Controller A and Controller B resolved to the same device.")
+                return summary_a, summary_b
+            except Exception as exc:
+                last_error = exc
+                if self.args.startup_wait <= 0 or time.monotonic() >= deadline:
+                    raise
+                print(f"Waiting for distinct Controller A/B devices: {exc}", flush=True)
+                time.sleep(min(self.args.reconnect_interval, 1.0))
+
+    def _build_reconnect_selector(self, requested: SelectorSpec, summary) -> SelectorSpec:
+        if requested.uniq or summary.uniq:
+            return SelectorSpec(uniq=requested.uniq or summary.uniq)
+        if requested.name or summary.name:
+            return SelectorSpec(name=requested.name or summary.name)
+        return requested
 
     def _install_signal_handlers(self) -> None:
         def _handler(signum, frame):  # noqa: ARG001
@@ -114,11 +160,12 @@ class FusionRuntime:
         signal.signal(signal.SIGINT, _handler)
         signal.signal(signal.SIGTERM, _handler)
 
-    def _open_source(self, path: str) -> SourceState:
+    def _open_source(self, path: str, source_name: str) -> SourceState:
         device = InputDevice(path)
-        state = SourceState(device=device)
+        state = SourceState(device=device, event_path=device.path)
 
         for code, absinfo in device.capabilities(absinfo=True).get(ecodes.EV_ABS, []):
+            state.abs_info[code] = absinfo
             state.abs_values[code] = absinfo.value
             state.abs_seq[code] = 0
 
@@ -128,8 +175,154 @@ class FusionRuntime:
         if self._should_grab(path):
             device.grab()
 
-        self.selector.register(device, selectors.EVENT_READ, device.path)
+        self.selector.register(device, selectors.EVENT_READ, source_name)
         return state
+
+    def _setup_udev_monitor(self) -> None:
+        try:
+            self.udev_context = pyudev.Context()
+            self.udev_monitor = pyudev.Monitor.from_netlink(self.udev_context)
+            self.udev_monitor.filter_by(subsystem="input")
+            self.udev_monitor.start()
+            self.selector.register(self.udev_monitor, selectors.EVENT_READ, "udev")
+        except Exception as exc:
+            self.udev_monitor = None
+            print(f"Udev monitor unavailable; falling back to polling only: {exc}", flush=True)
+
+    def _close_source(self, source_name: str) -> None:
+        source = self.sources.get(source_name)
+        if not source:
+            return
+        try:
+            self.selector.unregister(source.device)
+        except Exception:
+            pass
+        try:
+            source.device.ungrab()
+        except OSError:
+            pass
+        try:
+            source.device.close()
+        except OSError:
+            pass
+
+    def _mark_source_disconnected(self, source_name: str, reason: str) -> None:
+        source = self.sources.get(source_name)
+        if not source or not source.connected:
+            return
+
+        old_label = self.selected[source_name].label()
+        self._close_source(source_name)
+        source.connected = False
+        self.reconnect_after[source_name] = time.monotonic() + self.args.reconnect_interval
+        self._neutralize_source(source_name)
+        self.toggle_chord_was_down = False
+        print(f"Controller {source_name.upper()} disconnected: {old_label} ({reason})", flush=True)
+
+    def _neutralize_source(self, source_name: str) -> None:
+        source = self.sources[source_name]
+        for code in list(source.key_values):
+            source.key_values[code] = 0
+        for code in list(source.abs_values):
+            if code in self.output_absinfo:
+                source.abs_values[code] = self._neutral_abs_value(code)
+        if self.ui:
+            if self._rerender_output():
+                self.ui.syn()
+
+    def _reconnect_sources(self) -> None:
+        now = time.monotonic()
+        for source_name, source in list(self.sources.items()):
+            if source.connected:
+                continue
+            if now < self.reconnect_after.get(source_name, 0.0):
+                continue
+            self.reconnect_after[source_name] = now + self.args.reconnect_interval
+            try:
+                self._reconnect_source(source_name)
+            except Exception as exc:
+                if self.args.debug_reconnect:
+                    print(f"Controller {source_name.upper()} reconnect pending: {exc}", flush=True)
+
+    def _reconnect_source(self, source_name: str) -> None:
+        devices = enumerate_gamepads()
+        summary = resolve_device(devices, self.reconnect_selectors[source_name], source_name)
+        other_name = "b" if source_name == "a" else "a"
+        other = self.selected.get(other_name)
+        other_path = other.event_path if other and self.sources.get(other_name, None) and self.sources[other_name].connected else None
+        if other_path and summary.event_path == other_path:
+            raise RuntimeError("resolved to the other connected controller")
+
+        self.selected[source_name] = summary
+        self.sources[source_name] = self._open_source(summary.event_path, source_name)
+        if source_name == "a":
+            self._select_toggle_trigger_axes()
+            self.toggle_chord_was_down = self._toggle_chord_down()
+            if ecodes.EV_FF in self.sources["a"].device.capabilities():
+                self.ff_target = self.sources["a"].device
+            else:
+                self.ff_target = None
+
+        if self.ui and self._rerender_output():
+            self.ui.syn()
+        print(f"Controller {source_name.upper()} reconnected: {summary.label()}", flush=True)
+
+    def _check_source_presence(self) -> None:
+        now = time.monotonic()
+        if now < self.next_presence_check:
+            return
+        self.next_presence_check = now + self.args.reconnect_interval
+        for source_name, source in list(self.sources.items()):
+            if not source.connected:
+                continue
+            if not os.path.exists(source.event_path):
+                self._mark_source_disconnected(source_name, "device node disappeared")
+                continue
+            if not self._source_still_enumerated(source_name):
+                self._mark_source_disconnected(source_name, "device no longer enumerated")
+
+    def _source_still_enumerated(self, source_name: str) -> bool:
+        try:
+            devices = enumerate_gamepads()
+        except Exception:
+            return True
+
+        selected = self.selected[source_name]
+        reconnect_selector = self.reconnect_selectors[source_name]
+        source = self.sources[source_name]
+
+        if selected.uniq or reconnect_selector.uniq:
+            wanted = (reconnect_selector.uniq or selected.uniq).casefold()
+            return any(device.uniq.casefold() == wanted for device in devices)
+        return any(device.event_path == source.event_path for device in devices)
+
+    def _process_udev_events(self) -> None:
+        if not self.udev_monitor:
+            return
+        while True:
+            try:
+                device = self.udev_monitor.poll(timeout=0)
+            except Exception as exc:
+                if self.args.debug_reconnect:
+                    print(f"Udev monitor read failed: {exc}", flush=True)
+                return
+            if device is None:
+                return
+
+            devname = device.device_node or ""
+            action = device.action or ""
+            if self.args.debug_reconnect and action in {"add", "remove", "change"} and devname.startswith("/dev/input/"):
+                print(f"udev {action}: {devname}", flush=True)
+
+            if action == "remove":
+                for source_name, source in list(self.sources.items()):
+                    if source.connected and devname == source.event_path:
+                        self._mark_source_disconnected(source_name, "udev remove")
+
+            if action in {"add", "change"}:
+                for source_name, source in list(self.sources.items()):
+                    if not source.connected:
+                        self.reconnect_after[source_name] = 0.0
 
     def _should_grab(self, path: str) -> bool:
         if self.args.grab == "none":
@@ -225,6 +418,24 @@ class FusionRuntime:
             codes.update(source.key_values)
         return codes
 
+    def _select_toggle_trigger_axes(self) -> None:
+        source = self.sources["a"]
+        self.toggle_left_trigger_axes = self._preferred_present_axis(source, (ecodes.ABS_BRAKE, ecodes.ABS_Z))
+        self.toggle_right_trigger_axes = self._preferred_present_axis(source, (ecodes.ABS_GAS, ecodes.ABS_RZ))
+
+    def _preferred_present_axis(self, source: SourceState, candidates: tuple[int, ...]) -> tuple[int, ...]:
+        for code in candidates:
+            if code in source.abs_values:
+                return (code,)
+        return ()
+
+    def _is_toggle_event(self, event) -> bool:
+        if event.type == ecodes.EV_KEY:
+            return event.code in TOGGLE_LEFT_TRIGGER_KEYS + TOGGLE_RIGHT_TRIGGER_KEYS + TOGGLE_STICK_KEYS
+        if event.type == ecodes.EV_ABS:
+            return event.code in self.toggle_left_trigger_axes + self.toggle_right_trigger_axes
+        return False
+
     def _output_sources(self) -> tuple[SourceState, ...]:
         if self.fusion_enabled:
             return tuple(self.sources.values())
@@ -255,8 +466,8 @@ class FusionRuntime:
 
     def _normalized_left(self, which: str) -> tuple[float, float]:
         source = self.sources[which]
-        abs_x = source.device.absinfo(ecodes.ABS_X)
-        abs_y = source.device.absinfo(ecodes.ABS_Y)
+        abs_x = source.abs_info[ecodes.ABS_X]
+        abs_y = source.abs_info[ecodes.ABS_Y]
         value_x = source.abs_values.get(ecodes.ABS_X, abs_x.value)
         value_y = source.abs_values.get(ecodes.ABS_Y, abs_y.value)
         from fusion_common import normalize_axis
@@ -317,7 +528,7 @@ class FusionRuntime:
         for code in codes:
             if code not in source.abs_values:
                 continue
-            info = source.device.absinfo(code)
+            info = source.abs_info[code]
             span = info.max - info.min
             if span <= 0:
                 continue
@@ -326,22 +537,64 @@ class FusionRuntime:
                 return True
         return False
 
+    def _describe_trigger_axes(self, source: SourceState, codes: tuple[int, ...]) -> str:
+        parts = []
+        for code in codes:
+            if code not in source.abs_values:
+                continue
+            info = source.abs_info[code]
+            span = info.max - info.min
+            normalized = 0.0 if span <= 0 else (source.abs_values[code] - info.min) / span
+            parts.append(f"{ecodes.ABS.get(code, code)}={source.abs_values[code]}({normalized:.2f})")
+        return ",".join(parts) if parts else "missing"
+
     def _trigger_key_active(self, source: SourceState, codes: tuple[int, ...]) -> bool:
         return any(source.key_values.get(code, 0) for code in codes)
 
     def _toggle_chord_down(self) -> bool:
+        return all(self._toggle_chord_parts().values())
+
+    def _toggle_chord_parts(self) -> dict[str, bool]:
         source = self.sources.get("a")
         if not source:
-            return False
+            return {"lt": False, "rt": False, "ls": False, "rs": False}
 
-        left_trigger = self._trigger_axis_active(source, TOGGLE_LEFT_TRIGGER_AXES) or self._trigger_key_active(
+        left_trigger = self._trigger_axis_active(source, self.toggle_left_trigger_axes) or self._trigger_key_active(
             source, TOGGLE_LEFT_TRIGGER_KEYS
         )
-        right_trigger = self._trigger_axis_active(source, TOGGLE_RIGHT_TRIGGER_AXES) or self._trigger_key_active(
+        right_trigger = self._trigger_axis_active(source, self.toggle_right_trigger_axes) or self._trigger_key_active(
             source, TOGGLE_RIGHT_TRIGGER_KEYS
         )
-        sticks = all(source.key_values.get(code, 0) for code in TOGGLE_STICK_KEYS)
-        return left_trigger and right_trigger and sticks
+        return {
+            "lt": left_trigger,
+            "rt": right_trigger,
+            "ls": bool(source.key_values.get(ecodes.BTN_THUMBL, 0)),
+            "rs": bool(source.key_values.get(ecodes.BTN_THUMBR, 0)),
+        }
+
+    def _debug_toggle_state(self, event) -> None:
+        if not self.args.debug_toggle:
+            return
+        if not self._is_toggle_event(event):
+            return
+
+        source = self.sources["a"]
+        parts = self._toggle_chord_parts()
+        line = (
+            "Toggle chord: "
+            f"LT={parts['lt']} "
+            f"RT={parts['rt']} "
+            f"LS={parts['ls']} "
+            f"RS={parts['rs']} "
+            f"left_axes={self._describe_trigger_axes(source, self.toggle_left_trigger_axes)} "
+            f"right_axes={self._describe_trigger_axes(source, self.toggle_right_trigger_axes)} "
+            f"left_trigger_key={self._trigger_key_active(source, TOGGLE_LEFT_TRIGGER_KEYS)} "
+            f"right_trigger_key={self._trigger_key_active(source, TOGGLE_RIGHT_TRIGGER_KEYS)} "
+            f"last_event={ecodes.bytype[event.type].get(event.code, event.code)}:{event.value}"
+        )
+        if line != self.toggle_debug_last:
+            self.toggle_debug_last = line
+            print(line, flush=True)
 
     def _refresh_toggle_state(self) -> bool:
         chord_down = self._toggle_chord_down()
@@ -385,14 +638,20 @@ class FusionRuntime:
 
         if event.type == ecodes.EV_KEY:
             source.key_values[event.code] = int(event.value)
-            toggle_changed = self._refresh_toggle_state() if source_name == "a" else False
+            toggle_event = source_name == "a" and self._is_toggle_event(event)
+            if toggle_event:
+                self._debug_toggle_state(event)
+            toggle_changed = self._refresh_toggle_state() if toggle_event else False
             merged = self._merged_key_value(event.code)
             return toggle_changed | self._write_output(ecodes.EV_KEY, event.code, merged)
 
         if event.type == ecodes.EV_ABS:
             source.abs_values[event.code] = int(event.value)
             source.abs_seq[event.code] = self.sequence
-            toggle_changed = self._refresh_toggle_state() if source_name == "a" else False
+            toggle_event = source_name == "a" and self._is_toggle_event(event)
+            if toggle_event:
+                self._debug_toggle_state(event)
+            toggle_changed = self._refresh_toggle_state() if toggle_event else False
             if event.code in LEFT_STICK_CODES:
                 return toggle_changed | self._write_left_stick()
             merged = self._merged_abs_value(event.code)
@@ -443,19 +702,42 @@ class FusionRuntime:
                 if source_key == "ui":
                     if not self.ui:
                         continue
-                    for event in self.ui.read():
+                    try:
+                        ui_events = list(self.ui.read())
+                    except OSError as exc:
+                        if getattr(exc, "errno", None) in {errno.EAGAIN, errno.EWOULDBLOCK}:
+                            continue
+                        print(f"Virtual controller event read failed: {exc}", flush=True)
+                        continue
+                    for event in ui_events:
                         if event.type == ecodes.EV_SYN:
                             continue
                         self._process_ui_event(event)
                     continue
 
-                source_name = "a" if source_key == self.selected["a"].event_path else "b"
-                for event in self.sources[source_name].device.read():
+                if source_key == "udev":
+                    self._process_udev_events()
+                    continue
+
+                source_name = source_key
+                source = self.sources.get(source_name)
+                if not source or not source.connected:
+                    continue
+                try:
+                    events = list(source.device.read())
+                except OSError as exc:
+                    if getattr(exc, "errno", None) in {errno.EAGAIN, errno.EWOULDBLOCK}:
+                        continue
+                    self._mark_source_disconnected(source_name, str(exc))
+                    continue
+                for event in events:
                     if event.type == ecodes.EV_SYN:
                         continue
                     dirty |= self._process_event(source_name, event)
             if dirty and self.ui:
                 self.ui.syn()
+            self._check_source_presence()
+            self._reconnect_sources()
 
     def _print_startup_banner(self) -> None:
         print(f"Controller A: {self.selected['a'].label()}", flush=True)
@@ -471,6 +753,8 @@ class FusionRuntime:
         print(f"Grab mode: {self.args.grab}", flush=True)
         print("Fusion mode: ON", flush=True)
         print("Toggle binding: LT + RT + LS + RS on Controller A", flush=True)
+        if self.args.debug_toggle:
+            print("Toggle debug: enabled", flush=True)
 
     def close(self) -> None:
         if self.ui:
@@ -497,6 +781,11 @@ class FusionRuntime:
                 self.ui.close()
             except OSError:
                 pass
+        if self.udev_monitor:
+            try:
+                self.selector.unregister(self.udev_monitor)
+            except Exception:
+                pass
 
 
 def parse_args() -> argparse.Namespace:
@@ -515,7 +804,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--grab", choices=["none", "a", "b", "both"], default="none", help="Optionally grab source devices to hide them while the tool is running.")
     parser.add_argument("--dry-run", action="store_true", help="Print fused values without creating a virtual controller.")
     parser.add_argument("--debug", action="store_true", help="Print normalized source and fused left-stick values.")
+    parser.add_argument("--debug-toggle", action="store_true", help="Print LT/RT/LS/RS toggle chord state while Controller A inputs change.")
+    parser.add_argument("--debug-reconnect", action="store_true", help="Print failed reconnect attempts.")
     parser.add_argument("--debug-hz", type=float, default=10.0, help="Maximum debug print frequency.")
+    parser.add_argument("--reconnect-interval", type=float, default=1.0, help="Seconds between disconnected controller reconnect attempts.")
+    parser.add_argument("--startup-wait", type=float, default=DEFAULT_STARTUP_WAIT_SECONDS, help="Seconds to wait for two distinct controllers at startup.")
     parser.add_argument("--print-devices", action="store_true", help="List joystick-capable devices and exit.")
     parser.add_argument("--print-selection-json", action="store_true", help="Resolve Controller A and B and print the selected device metadata as JSON.")
     parser.add_argument("--virtual-name", default="Controller Fusion Prototype", help="Name of the virtual controller.")
@@ -590,6 +883,7 @@ def main() -> int:
         return 0
     except Exception as exc:
         print(f"error: {exc}", file=sys.stderr)
+        traceback.print_exc(file=sys.stderr)
         return 1
     finally:
         if runtime:
