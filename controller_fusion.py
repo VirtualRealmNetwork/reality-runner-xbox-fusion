@@ -189,7 +189,7 @@ class FusionRuntime:
             self.udev_monitor = None
             print(f"Udev monitor unavailable; falling back to polling only: {exc}", flush=True)
 
-    def _close_source(self, source_name: str) -> None:
+    def _close_source(self, source_name: str, *, close_device: bool = True) -> None:
         source = self.sources.get(source_name)
         if not source:
             return
@@ -197,6 +197,8 @@ class FusionRuntime:
             self.selector.unregister(source.device)
         except Exception:
             pass
+        if not close_device:
+            return
         try:
             source.device.ungrab()
         except OSError:
@@ -212,7 +214,11 @@ class FusionRuntime:
             return
 
         old_label = self.selected[source_name].label()
-        self._close_source(source_name)
+        if source_name == "a":
+            self.ff_target = None
+        # Closing a vanished Bluetooth evdev fd can block in evdev_cleanup.
+        # Detach it from the selector and let process shutdown reclaim it.
+        self._close_source(source_name, close_device=False)
         source.connected = False
         self.reconnect_after[source_name] = time.monotonic() + self.args.reconnect_interval
         self._neutralize_source(source_name)
@@ -277,24 +283,6 @@ class FusionRuntime:
                 continue
             if not os.path.exists(source.event_path):
                 self._mark_source_disconnected(source_name, "device node disappeared")
-                continue
-            if not self._source_still_enumerated(source_name):
-                self._mark_source_disconnected(source_name, "device no longer enumerated")
-
-    def _source_still_enumerated(self, source_name: str) -> bool:
-        try:
-            devices = enumerate_gamepads()
-        except Exception:
-            return True
-
-        selected = self.selected[source_name]
-        reconnect_selector = self.reconnect_selectors[source_name]
-        source = self.sources[source_name]
-
-        if selected.uniq or reconnect_selector.uniq:
-            wanted = (reconnect_selector.uniq or selected.uniq).casefold()
-            return any(device.uniq.casefold() == wanted for device in devices)
-        return any(device.event_path == source.event_path for device in devices)
 
     def _process_udev_events(self) -> None:
         if not self.udev_monitor:
@@ -663,6 +651,14 @@ class FusionRuntime:
 
     def _process_ui_event(self, event) -> bool:
         if not self.ui or not self.ff_target:
+            if self.ui and event.type == ecodes.EV_UINPUT and event.code == ecodes.UI_FF_UPLOAD:
+                upload = self.ui.begin_upload(event.value)
+                upload.retval = -errno.ENODEV
+                self.ui.end_upload(upload)
+            elif self.ui and event.type == ecodes.EV_UINPUT and event.code == ecodes.UI_FF_ERASE:
+                erase = self.ui.begin_erase(event.value)
+                erase.retval = -errno.ENODEV
+                self.ui.end_erase(erase)
             return False
 
         if event.type == ecodes.EV_UINPUT:
@@ -671,24 +667,32 @@ class FusionRuntime:
                 if upload.effect.id not in self.ff_effect_ids:
                     self.ff_effect_ids.add(upload.effect.id)
                     upload.effect.id = -1
-                self.ff_target.upload_effect(upload.effect)
-                upload.retval = 0
+                try:
+                    self.ff_target.upload_effect(upload.effect)
+                    upload.retval = 0
+                except OSError as exc:
+                    upload.retval = -abs(getattr(exc, "errno", errno.ENODEV) or errno.ENODEV)
+                    self.ff_target = None
                 self.ui.end_upload(upload)
                 return False
 
             if event.code == ecodes.UI_FF_ERASE:
                 erase = self.ui.begin_erase(event.value)
-                erase.retval = 0
                 try:
+                    erase.retval = 0
                     self.ff_target.erase_effect(erase.effect_id)
-                except OSError:
-                    pass
+                except OSError as exc:
+                    erase.retval = -abs(getattr(exc, "errno", errno.ENODEV) or errno.ENODEV)
+                    self.ff_target = None
                 self.ff_effect_ids.discard(erase.effect_id)
                 self.ui.end_erase(erase)
                 return False
 
         if event.type == ecodes.EV_FF:
-            self.ff_target.write(event.type, event.code, event.value)
+            try:
+                self.ff_target.write(event.type, event.code, event.value)
+            except OSError:
+                self.ff_target = None
             return False
 
         return False
@@ -763,6 +767,8 @@ class FusionRuntime:
             self.ui.syn()
 
         for source in self.sources.values():
+            if not source.connected:
+                continue
             try:
                 source.device.ungrab()
             except OSError:
