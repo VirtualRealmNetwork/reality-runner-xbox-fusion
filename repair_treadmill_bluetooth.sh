@@ -2,7 +2,10 @@
 
 set -euo pipefail
 
-DEVICE_MAC="${DEVICE_MAC:-AA:BB:CC:DD:EE:01}"
+DEVICE_MAC_V1="AA:BB:CC:DD:EE:01"
+DEVICE_MAC_V2="AA:BB:CC:DD:EE:02"
+DEVICE_VERSION="${DEVICE_VERSION:-v2}"
+DEVICE_MAC="${DEVICE_MAC:-}"
 DEVICE_NAME="${DEVICE_NAME:-Reality Runner XINPUT}"
 SCAN_SECONDS="${SCAN_SECONDS:-15}"
 PAIR_SCAN_SECONDS="${PAIR_SCAN_SECONDS:-5}"
@@ -22,7 +25,10 @@ This is intended for the case where the treadmill has recently been paired to
 another computer and the local Linux bond may be stale.
 
 Options:
-  --mac MAC             Override device MAC address. Default: auto-detect by name
+  --v1                  Use the Reality Runner v1 MAC (${DEVICE_MAC_V1})
+  --v2                  Use the Reality Runner v2 MAC (${DEVICE_MAC_V2}). Default
+  --version VERSION     Select treadmill version: v1 or v2. Default: ${DEVICE_VERSION}
+  --mac MAC             Override device MAC address
   --name NAME           Override expected device name. Default: ${DEVICE_NAME}
   --scan-seconds N      BLE scan duration in seconds. Default: ${SCAN_SECONDS}
   --log-dir DIR         Override log directory. Default: ${LOG_DIR}
@@ -30,10 +36,12 @@ Options:
   --help                Show this help text.
 
 Environment overrides:
-  DEVICE_MAC, DEVICE_NAME, SCAN_SECONDS, PAIR_SCAN_SECONDS, PAIR_TIMEOUT, CONNECT_TIMEOUT, PAIR_RETRIES, LOG_DIR
+  DEVICE_VERSION, DEVICE_MAC, DEVICE_NAME, SCAN_SECONDS, PAIR_SCAN_SECONDS, PAIR_TIMEOUT, CONNECT_TIMEOUT, PAIR_RETRIES, LOG_DIR
 
 Examples:
   ./$(basename "$0")
+  ./$(basename "$0") --v1
+  DEVICE_VERSION=v1 ./$(basename "$0")
   ./$(basename "$0") --scan-only
   DEVICE_MAC=AA:BB:CC:DD:EE:FF ./$(basename "$0")
 EOF
@@ -118,6 +126,27 @@ ensure_device_mac() {
   fi
 
   die "Could not resolve a device MAC for ${DEVICE_NAME}. Pass --mac or set DEVICE_MAC."
+}
+
+set_default_device_mac() {
+  if [[ -n "$DEVICE_MAC" ]]; then
+    DEVICE_VERSION="custom"
+    return 0
+  fi
+
+  case "$DEVICE_VERSION" in
+    v1|V1|1)
+      DEVICE_VERSION="v1"
+      DEVICE_MAC="$DEVICE_MAC_V1"
+      ;;
+    v2|V2|2)
+      DEVICE_VERSION="v2"
+      DEVICE_MAC="$DEVICE_MAC_V2"
+      ;;
+    *)
+      die "DEVICE_VERSION must be v1 or v2, got: ${DEVICE_VERSION}"
+      ;;
+  esac
 }
 
 prepare_adapter() {
@@ -276,6 +305,19 @@ setup_logging() {
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
+    --v1)
+      DEVICE_VERSION="v1"
+      shift
+      ;;
+    --v2)
+      DEVICE_VERSION="v2"
+      shift
+      ;;
+    --version)
+      [[ $# -ge 2 ]] || die "--version requires a value"
+      DEVICE_VERSION="$2"
+      shift 2
+      ;;
     --mac)
       [[ $# -ge 2 ]] || die "--mac requires a value"
       DEVICE_MAC="$2"
@@ -333,12 +375,9 @@ if ! [[ "$PAIR_RETRIES" =~ ^[0-9]+$ ]] || (( PAIR_RETRIES < 1 )); then
   die "PAIR_RETRIES must be a positive integer"
 fi
 
+set_default_device_mac
 setup_logging
-if [[ -n "$DEVICE_MAC" ]]; then
-  log "Target device: ${DEVICE_NAME} (${DEVICE_MAC})"
-else
-  log "Target device: ${DEVICE_NAME} (MAC will be auto-detected)"
-fi
+log "Target device: ${DEVICE_NAME} ${DEVICE_VERSION} (${DEVICE_MAC})"
 
 prepare_adapter
 scan_for_device

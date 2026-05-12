@@ -24,6 +24,7 @@ The implementation targets Linux input devices through `evdev` and creates the f
 - [`fusion_common.py`](fusion_common.py): shared device selection and fusion math
 - [`run_fusion.sh`](run_fusion.sh): helper launcher that activates conda and starts the main runtime
 - [`run_fusion_and_steam.sh`](run_fusion_and_steam.sh): helper that starts fusion first and launches Steam with SDL limited to the virtual controller
+- [`repair_treadmill_bluetooth.sh`](repair_treadmill_bluetooth.sh): helper for re-pairing and reconnecting Reality Runner over Bluetooth
 - [`environment.yml`](environment.yml): conda environment definition
 
 ## How It Works
@@ -91,6 +92,42 @@ Installed Python packages:
 
 - `evdev`
 - `pyudev`
+
+## Reality Runner Bluetooth
+
+Use the repair helper when the treadmill is not connected, has just been paired to another computer, or the Linux Bluetooth bond is stale.
+
+Reality Runner v2 is the default:
+
+```bash
+./repair_treadmill_bluetooth.sh
+```
+
+Select a specific treadmill version:
+
+```bash
+./repair_treadmill_bluetooth.sh --v2
+./repair_treadmill_bluetooth.sh --v1
+DEVICE_VERSION=v1 ./repair_treadmill_bluetooth.sh
+```
+
+Current known treadmill MAC addresses:
+
+- v1: `AA:BB:CC:DD:EE:01`
+- v2: `AA:BB:CC:DD:EE:02`
+
+To check whether the selected treadmill is visible without changing pairing state:
+
+```bash
+./repair_treadmill_bluetooth.sh --scan-only
+./repair_treadmill_bluetooth.sh --v1 --scan-only
+```
+
+For a replacement treadmill or another Bluetooth address, override the MAC directly:
+
+```bash
+DEVICE_MAC=AA:BB:CC:DD:EE:FF ./repair_treadmill_bluetooth.sh
+```
 
 ## Device Enumeration
 
