@@ -248,6 +248,8 @@ The helper forwards extra flags directly to the main runtime, so these work too:
 
 The Steam helper starts the fusion runtime with `--grab both`, waits briefly for the virtual controller to appear, then launches Steam with SDL restricted to the fused controller via `SDL_GAMECONTROLLER_IGNORE_DEVICES_EXCEPT`.
 
+Exit Steam completely before using this helper. The SDL controller filter only applies when this script starts the Steam client; if Steam is already running, the helper exits with an error instead of starting fusion and immediately cleaning it up.
+
 Why this helper exists:
 
 - plain `--grab both` is not enough to hide the original Bluetooth controllers from every consumer

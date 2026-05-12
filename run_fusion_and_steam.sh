@@ -9,6 +9,8 @@ VIRTUAL_NAME="${VIRTUAL_NAME:-Controller Fusion Prototype}"
 FUSION_RESTART_DELAY="${FUSION_RESTART_DELAY:-2}"
 LOG_DIR="${LOG_DIR:-${SCRIPT_DIR}/logs}"
 FUSION_LOG="${FUSION_LOG:-${LOG_DIR}/fusion-and-steam.log}"
+STEAM_BIN="${STEAM_BIN:-steam}"
+STEAM_START_TIMEOUT="${STEAM_START_TIMEOUT:-20}"
 
 find_conda_sh() {
   if [[ -n "${CONDA_SH:-}" ]]; then
@@ -33,6 +35,26 @@ conda activate "${ENV_NAME}"
 
 mkdir -p "${LOG_DIR}"
 
+steam_pids() {
+  pgrep -u "$(id -u)" -x steam || true
+}
+
+wait_for_steam_pid() {
+  local deadline=$((SECONDS + STEAM_START_TIMEOUT))
+  local pid
+
+  while (( SECONDS < deadline )); do
+    pid="$(steam_pids | head -n 1)"
+    if [[ -n "${pid}" ]]; then
+      printf '%s\n' "${pid}"
+      return 0
+    fi
+    sleep 1
+  done
+
+  return 1
+}
+
 start_fusion() {
   echo "[$(date --iso-8601=seconds)] starting controller fusion" | tee -a "${FUSION_LOG}"
   PYTHONUNBUFFERED=1 "${SCRIPT_DIR}/controller_fusion.py" \
@@ -52,6 +74,12 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
+if [[ -n "$(steam_pids)" ]]; then
+  echo "error: Steam is already running. Exit Steam completely, then run this script again." >&2
+  echo "       The SDL controller filter only applies when this script starts Steam." >&2
+  exit 1
+fi
+
 start_fusion "$@"
 sleep 1
 if ! kill -0 "${FUSION_PID}" >/dev/null 2>&1; then
@@ -60,8 +88,15 @@ if ! kill -0 "${FUSION_PID}" >/dev/null 2>&1; then
   exit 1
 fi
 
-/usr/bin/env SDL_GAMECONTROLLER_IGNORE_DEVICES_EXCEPT="${VIRTUAL_VENDOR}/${VIRTUAL_PRODUCT}" steam &
-STEAM_PID=$!
+echo "[$(date --iso-8601=seconds)] launching Steam with SDL limited to ${VIRTUAL_VENDOR}/${VIRTUAL_PRODUCT}" | tee -a "${FUSION_LOG}"
+/usr/bin/env SDL_GAMECONTROLLER_IGNORE_DEVICES_EXCEPT="${VIRTUAL_VENDOR}/${VIRTUAL_PRODUCT}" "${STEAM_BIN}" &
+STEAM_LAUNCHER_PID=$!
+
+if ! STEAM_PID="$(wait_for_steam_pid)"; then
+  echo "error: Steam did not stay running after launch." >&2
+  wait "${STEAM_LAUNCHER_PID}" >/dev/null 2>&1 || true
+  exit 1
+fi
 
 while kill -0 "${STEAM_PID}" >/dev/null 2>&1; do
   if ! kill -0 "${FUSION_PID}" >/dev/null 2>&1; then
