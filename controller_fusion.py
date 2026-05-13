@@ -22,6 +22,7 @@ from fusion_common import (
     denormalize_axis,
     enumerate_gamepads,
     fuse_left_stick,
+    is_reality_runner_v2,
     resolve_device,
 )
 
@@ -77,6 +78,7 @@ class FusionRuntime:
         self.toggle_debug_last = ""
         self.toggle_left_trigger_axes: tuple[int, ...] = ()
         self.toggle_right_trigger_axes: tuple[int, ...] = ()
+        self.b_supports_backward = False
         self._setup()
 
     def _setup(self) -> None:
@@ -94,6 +96,7 @@ class FusionRuntime:
         summary_a, summary_b = self._resolve_startup_devices(selector_a, selector_b)
 
         self.selected = {"a": summary_a, "b": summary_b}
+        self.b_supports_backward = is_reality_runner_v2(summary_b)
         self.reconnect_selectors = {
             "a": self._build_reconnect_selector(selector_a, summary_a),
             "b": self._build_reconnect_selector(selector_b, summary_b),
@@ -260,6 +263,8 @@ class FusionRuntime:
             raise RuntimeError("resolved to the other connected controller")
 
         self.selected[source_name] = summary
+        if source_name == "b":
+            self.b_supports_backward = is_reality_runner_v2(summary)
         self.sources[source_name] = self._open_source(summary.event_path, source_name)
         if source_name == "a":
             self._select_toggle_trigger_axes()
@@ -490,6 +495,7 @@ class FusionRuntime:
             b_y,
             self.args.deadzone_a,
             self.args.deadzone_b,
+            self.b_supports_backward,
         )
         raw_x = denormalize_axis(fused_x, self.output_absinfo[ecodes.ABS_X])
         raw_y = denormalize_axis(fused_y, self.output_absinfo[ecodes.ABS_Y])
@@ -506,6 +512,7 @@ class FusionRuntime:
                     f"fused=({fused_x:+.3f},{fused_y:+.3f}) "
                     f"a_active={debug['a_active']} "
                     f"b_mag={debug['b_magnitude']:.3f} "
+                    f"b_backward={debug['b_backward']} "
                     f"angle_source={debug['angle_source']}"
                 ),
                 flush=True,
@@ -755,6 +762,7 @@ class FusionRuntime:
             else:
                 print("Force feedback target: unavailable on Controller A", flush=True)
         print(f"Grab mode: {self.args.grab}", flush=True)
+        print(f"Controller B backward support: {'ON' if self.b_supports_backward else 'OFF'}", flush=True)
         print("Fusion mode: ON", flush=True)
         print("Toggle binding: LT + RT + LS + RS on Controller A", flush=True)
         if self.args.debug_toggle:

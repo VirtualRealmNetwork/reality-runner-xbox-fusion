@@ -10,6 +10,8 @@ from typing import Iterable
 import pyudev
 from evdev import InputDevice, ecodes, list_devices
 
+REALITY_RUNNER_V2_UNIQS = {"aa:bb:cc:dd:ee:02"}
+
 
 @dataclass(frozen=True)
 class DeviceSummary:
@@ -188,6 +190,10 @@ def resolve_device(devices: list[DeviceSummary], selector: SelectorSpec, role: s
     return matches[0]
 
 
+def is_reality_runner_v2(summary: DeviceSummary) -> bool:
+    return summary.uniq.casefold() in REALITY_RUNNER_V2_UNIQS
+
+
 def center_for(absinfo) -> float:
     return (absinfo.min + absinfo.max) / 2.0
 
@@ -225,11 +231,13 @@ def fuse_left_stick(
     b_y: float,
     deadzone_a: float,
     deadzone_b: float,
+    b_supports_backward: bool = False,
 ) -> tuple[float, float, dict[str, float | bool | str]]:
     dz_a_x, dz_a_y, magnitude_a = radial_deadzone(a_x, a_y, deadzone_a)
-    _, _, magnitude_b = radial_deadzone(b_x, b_y, deadzone_b)
+    _, dz_b_y, magnitude_b = radial_deadzone(b_x, b_y, deadzone_b)
 
     angle_active = magnitude_a > 0.0
+    b_backward = b_supports_backward and dz_b_y > 0.0
     if magnitude_b <= 0.0:
         fused_x = 0.0
         fused_y = 0.0
@@ -237,19 +245,22 @@ def fuse_left_stick(
         angle_radians = 0.0
     elif angle_active:
         angle_radians = math.atan2(dz_a_y, dz_a_x)
+        if b_backward:
+            angle_radians += math.pi
         fused_x = math.cos(angle_radians) * magnitude_b
         fused_y = math.sin(angle_radians) * magnitude_b
-        angle_source = "controller_a"
+        angle_source = "controller_a_opposite" if b_backward else "controller_a"
     else:
         fused_x = 0.0
-        fused_y = -magnitude_b
-        angle_radians = -math.pi / 2.0
-        angle_source = "forward"
+        fused_y = magnitude_b if b_backward else -magnitude_b
+        angle_radians = math.pi / 2.0 if b_backward else -math.pi / 2.0
+        angle_source = "backward" if b_backward else "forward"
 
     debug = {
         "a_active": angle_active,
         "a_magnitude": magnitude_a,
         "b_magnitude": magnitude_b,
+        "b_backward": b_backward,
         "angle_source": angle_source,
         "angle_radians": angle_radians,
     }

@@ -47,6 +47,7 @@ Current fallback behavior:
 
 - if B is centered, fused output is centered
 - if A is centered but B is nonzero, fused output points forward
+- if Controller B is the known Reality Runner v2 and reports backward motion, the fused output uses the opposite direction
 
 Runtime toggle:
 
@@ -274,6 +275,7 @@ This prints:
 - whether A is outside deadzone
 - A magnitude after deadzone
 - B magnitude after deadzone
+- whether Controller B is driving backward
 - which angle source was used
 
 ## Testing With Steam Or A Game
@@ -342,7 +344,7 @@ Force feedback behavior:
 
 - Linux-only prototype
 - virtual output is a Linux `uinput` gamepad, not a native XInput device
-- current fallback when A is centered and B is nonzero is fixed forward
+- current fallback when A is centered and B is nonzero is fixed forward, except for known Reality Runner v2 backward motion
 - force feedback is forwarded only to Controller A
 - if both controllers drive the same non-left-stick control at once, the merge rules above apply
 

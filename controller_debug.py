@@ -9,7 +9,14 @@ import time
 
 from evdev import InputDevice, ecodes
 
-from fusion_common import SelectorSpec, enumerate_gamepads, fuse_left_stick, normalize_axis, resolve_device
+from fusion_common import (
+    SelectorSpec,
+    enumerate_gamepads,
+    fuse_left_stick,
+    is_reality_runner_v2,
+    normalize_axis,
+    resolve_device,
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -59,6 +66,7 @@ def live_debug(args: argparse.Namespace) -> int:
 
     source_a = InputDevice(device_a.event_path)
     source_b = InputDevice(device_b.event_path)
+    b_supports_backward = is_reality_runner_v2(device_b)
     selector = selectors.DefaultSelector()
     selector.register(source_a, selectors.EVENT_READ, "a")
     selector.register(source_b, selectors.EVENT_READ, "b")
@@ -85,6 +93,7 @@ def live_debug(args: argparse.Namespace) -> int:
 
     print(f"Controller A: {device_a.label()}")
     print(f"Controller B: {device_b.label()}")
+    print(f"Controller B backward support: {'ON' if b_supports_backward else 'OFF'}")
     print("Live debug started. Press Ctrl-C to stop.", flush=True)
 
     try:
@@ -117,6 +126,7 @@ def live_debug(args: argparse.Namespace) -> int:
                 b_y,
                 args.deadzone_a,
                 args.deadzone_b,
+                b_supports_backward,
             )
             print(
                 (
@@ -126,6 +136,7 @@ def live_debug(args: argparse.Namespace) -> int:
                     f"a_active={debug['a_active']} "
                     f"a_mag={debug['a_magnitude']:.3f} "
                     f"b_mag={debug['b_magnitude']:.3f} "
+                    f"b_backward={debug['b_backward']} "
                     f"angle_source={debug['angle_source']}"
                 ),
                 flush=True,
