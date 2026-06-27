@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import errno
 import json
+import math
 import os
 import selectors
 import signal
@@ -16,9 +17,11 @@ import pyudev
 from evdev import AbsInfo, InputDevice, UInput, ecodes
 
 from fusion_common import (
+    IntensityBlender,
     SelectorSpec,
     center_for,
     choose_default_device,
+    compute_geometry,
     denormalize_axis,
     enumerate_gamepads,
     fuse_left_stick,
@@ -30,6 +33,12 @@ from fusion_common import (
 LEFT_STICK_CODES = {ecodes.ABS_X, ecodes.ABS_Y}
 ONE_SIDED_ABS_CODES = {ecodes.ABS_GAS, ecodes.ABS_BRAKE}
 DEFAULT_DEADZONE = 0.18
+DEFAULT_BLEND_HOLD = 0.40
+DEFAULT_BLEND_RAMP = 0.10
+DEFAULT_BLEND_DEBOUNCE = 0.06
+DEFAULT_STEER_OFF = 0.10
+DEFAULT_EPS_MOVE = 0.08
+DEFAULT_TICK_HZ = 250.0
 DEFAULT_VIRTUAL_VENDOR = 0xF155
 DEFAULT_VIRTUAL_PRODUCT = 0x0001
 DEFAULT_STARTUP_WAIT_SECONDS = 30.0
@@ -79,6 +88,18 @@ class FusionRuntime:
         self.toggle_left_trigger_axes: tuple[int, ...] = ()
         self.toggle_right_trigger_axes: tuple[int, ...] = ()
         self.b_supports_backward = False
+        self.blender: IntensityBlender | None = None
+        self._last_blend_t: float | None = None
+        self._tick_period = 1.0 / max(args.tick_hz, 1.0)
+        if args.steer_blend:
+            self.blender = IntensityBlender(
+                hold=args.blend_hold,
+                ramp=args.blend_ramp,
+                eps_move=args.eps_move,
+                debounce=args.blend_debounce,
+                on_threshold=args.deadzone_a,
+                off_threshold=args.steer_off,
+            )
         self._setup()
 
     def _setup(self) -> None:
@@ -485,18 +506,49 @@ class FusionRuntime:
             print(f"A=({a_x:+.3f},{a_y:+.3f}) fusion=off", flush=True)
         return changed
 
+    def _blend_debug_suffix(self, fused_x: float, fused_y: float) -> str:
+        if self.blender is None:
+            return ""
+        return f" w={self.blender.weight():.3f} m={math.hypot(fused_x, fused_y):.3f}"
+
     def _write_fused_left_stick(self) -> bool:
         a_x, a_y = self._normalized_left("a")
         b_x, b_y = self._normalized_left("b")
-        fused_x, fused_y, debug = fuse_left_stick(
-            a_x,
-            a_y,
-            b_x,
-            b_y,
-            self.args.deadzone_a,
-            self.args.deadzone_b,
-            self.b_supports_backward,
-        )
+        if self.blender is not None:
+            ux, uy, mag_a, mag_b, a_active, b_backward, angle_radians, angle_source = compute_geometry(
+                a_x,
+                a_y,
+                b_x,
+                b_y,
+                self.args.deadzone_a,
+                self.args.deadzone_b,
+                self.b_supports_backward,
+            )
+            now = time.monotonic()
+            dt = 0.0 if self._last_blend_t is None else max(0.0, now - self._last_blend_t)
+            self._last_blend_t = now
+            raw_mag_a = math.hypot(a_x, a_y)
+            m = self.blender.update(mag_a, mag_b, raw_mag_a, dt)
+            fused_x = ux * m
+            fused_y = uy * m
+            debug = {
+                "a_active": a_active,
+                "a_magnitude": mag_a,
+                "b_magnitude": mag_b,
+                "b_backward": b_backward,
+                "angle_source": angle_source,
+                "angle_radians": angle_radians,
+            }
+        else:
+            fused_x, fused_y, debug = fuse_left_stick(
+                a_x,
+                a_y,
+                b_x,
+                b_y,
+                self.args.deadzone_a,
+                self.args.deadzone_b,
+                self.b_supports_backward,
+            )
         raw_x = denormalize_axis(fused_x, self.output_absinfo[ecodes.ABS_X])
         raw_y = denormalize_axis(fused_y, self.output_absinfo[ecodes.ABS_Y])
         changed = False
@@ -514,6 +566,7 @@ class FusionRuntime:
                     f"b_mag={debug['b_magnitude']:.3f} "
                     f"b_backward={debug['b_backward']} "
                     f"angle_source={debug['angle_source']}"
+                    f"{self._blend_debug_suffix(fused_x, fused_y)}"
                 ),
                 flush=True,
             )
@@ -596,6 +649,9 @@ class FusionRuntime:
         changed = False
         if chord_down and not self.toggle_chord_was_down:
             self.fusion_enabled = not self.fusion_enabled
+            if self.blender is not None:
+                self.blender.reset()
+                self._last_blend_t = None
             print(f"Fusion mode: {'ON' if self.fusion_enabled else 'OFF'}", flush=True)
             changed = self._rerender_output()
         self.toggle_chord_was_down = chord_down
@@ -704,11 +760,16 @@ class FusionRuntime:
 
         return False
 
+    def _select_timeout(self) -> float:
+        if self.blender is not None and self.fusion_enabled and self.blender.is_active():
+            return self._tick_period
+        return 0.1
+
     def run(self) -> None:
         self._print_startup_banner()
         while not self.should_stop:
             dirty = False
-            for key, _ in self.selector.select(timeout=0.1):
+            for key, _ in self.selector.select(timeout=self._select_timeout()):
                 source_key = key.data
                 if source_key == "ui":
                     if not self.ui:
@@ -745,6 +806,8 @@ class FusionRuntime:
                     if event.type == ecodes.EV_SYN:
                         continue
                     dirty |= self._process_event(source_name, event)
+            if self.blender is not None and self.fusion_enabled:
+                dirty |= self._write_left_stick()
             if dirty and self.ui:
                 self.ui.syn()
             self._check_source_presence()
@@ -815,6 +878,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--b-name", help="Match Controller B by a case-insensitive name substring.")
     parser.add_argument("--deadzone-a", type=float, default=DEFAULT_DEADZONE, help="Radial deadzone for Controller A's left stick.")
     parser.add_argument("--deadzone-b", type=float, default=DEFAULT_DEADZONE, help="Radial deadzone for Controller B's left stick.")
+    parser.add_argument("--steer-blend", action="store_true", help="Enable Controller A intensity lead-blend to mask treadmill latency (mode 2).")
+    parser.add_argument("--blend-hold", type=float, default=DEFAULT_BLEND_HOLD, help="Seconds to hold A weight at 1.0 after an A activity edge.")
+    parser.add_argument("--blend-ramp", type=float, default=DEFAULT_BLEND_RAMP, help="Seconds to linearly decay A weight from 1.0 to 0 after the hold.")
+    parser.add_argument("--blend-debounce", type=float, default=DEFAULT_BLEND_DEBOUNCE, help="Seconds the stick must stay disengaged before a release counts as a stop (debounces direction reversals).")
+    parser.add_argument("--steer-off", type=float, default=DEFAULT_STEER_OFF, help="Hysteresis off-threshold: A disengages only below this raw stick magnitude (engages at --deadzone-a), so reversals through center do not chop output.")
+    parser.add_argument("--eps-move", type=float, default=DEFAULT_EPS_MOVE, help="Output-magnitude threshold separating idle from already-moving at a rising A edge.")
+    parser.add_argument("--tick-hz", type=float, default=DEFAULT_TICK_HZ, help="Output tick rate (Hz) while the blend schedule is active.")
     parser.add_argument("--grab", choices=["none", "a", "b", "both"], default="none", help="Optionally grab source devices to hide them while the tool is running.")
     parser.add_argument("--dry-run", action="store_true", help="Print fused values without creating a virtual controller.")
     parser.add_argument("--debug", action="store_true", help="Print normalized source and fused left-stick values.")

@@ -26,6 +26,9 @@ The implementation targets Linux input devices through `evdev` and creates the f
 - [`run_fusion_and_steam.sh`](run_fusion_and_steam.sh): helper that starts fusion first and launches Steam with SDL limited to the virtual controller
 - [`repair_treadmill_bluetooth.sh`](repair_treadmill_bluetooth.sh): helper for re-pairing and reconnecting Reality Runner over Bluetooth
 - [`environment.yml`](environment.yml): conda environment definition
+- [`magnitude_logger.py`](magnitude_logger.py): logs the treadmill stick magnitude with timestamps (latency measurement)
+- [`test_blend.py`](test_blend.py): hardware-free unit tests for the steering intensity blend
+- [`docs/steering-intensity-blend-plan.md`](docs/steering-intensity-blend-plan.md): design + implementation notes for the steering intensity blend
 
 ## How It Works
 
@@ -69,6 +72,46 @@ The helper scripts default the virtual controller to a custom VID/PID:
 - product `0x0001`
 
 That makes it possible to tell Steam/SDL to expose only the fused controller and ignore the two physical ones.
+
+## Steering Intensity Blend (treadmill latency masking)
+
+The treadmill derives its stick magnitude from a sliding-window magnet-pulse count, so it
+lags real intent (~100 ms to ramp up, ~300-500 ms to decay after you stop). In intense
+action games that stop-lag is noticeable. The optional `--steer-blend` mode masks it by
+leading with Controller A's zero-latency stick intensity and settling to the treadmill's
+accurate value:
+
+- fast start: push the stick from rest and output jumps to A's intensity immediately, then
+  hands over to the treadmill once it has caught up;
+- fast stop: release the stick and output snaps toward zero immediately, instead of waiting
+  out the treadmill's slow decay;
+- while already moving, pushing the stick only steers (no speed glitch); the treadmill still
+  sets your intensity.
+
+A weight `w` starts at 1 on an engagement change, holds for `--blend-hold` seconds, then
+ramps to 0 over `--blend-ramp`; output magnitude is `w*A + (1-w)*B`. Engagement uses a
+Schmitt trigger (engage at `--deadzone-a`, disengage below `--steer-off`) plus a
+`--blend-debounce` confirm, so sweeping the stick through center during a direction reversal
+does not chop output to zero.
+
+`--steer-blend` is OFF by default in the CLI but is enabled automatically by
+`run_fusion_and_steam.sh`. Tunables (defaults shown):
+
+| flag | default | meaning |
+|------|---------|---------|
+| `--steer-blend` | off | enable the blend (only while steering; treadmill-only forward is unchanged) |
+| `--blend-hold` | 0.40 | seconds the A-lead holds at full weight after an edge (~ treadmill decay) |
+| `--blend-ramp` | 0.10 | seconds to ramp the A-lead back to the treadmill |
+| `--blend-debounce` | 0.06 | seconds the stick must stay released before it counts as a stop |
+| `--steer-off` | 0.10 | hysteresis: A disengages only below this raw stick magnitude (must exceed the Xbox stick's rest drift) |
+| `--eps-move` | 0.08 | output-magnitude threshold separating "idle" from "already moving" |
+| `--tick-hz` | 250 | output refresh rate while the blend schedule is active |
+
+See [`docs/steering-intensity-blend-plan.md`](docs/steering-intensity-blend-plan.md) for the
+full design rationale. Use `magnitude_logger.py` (treadmill dashboard Pulse Detector OFF) to
+measure the treadmill's decay if you want to pin `--blend-hold`. Note `--steer-off` must stay
+above your Xbox stick's resting magnitude (check `--dry-run --debug`) or a release will never
+register as a stop.
 
 ## Environment Setup
 
@@ -247,7 +290,7 @@ The helper forwards extra flags directly to the main runtime, so these work too:
 ./run_fusion.sh --grab both --deadzone-a 0.12 --deadzone-b 0.20
 ```
 
-The Steam helper starts the fusion runtime with `--grab both`, waits briefly for the virtual controller to appear, then launches Steam with SDL restricted to the fused controller via `SDL_GAMECONTROLLER_IGNORE_DEVICES_EXCEPT`.
+The Steam helper starts the fusion runtime with `--grab both --steer-blend`, waits briefly for the virtual controller to appear, then launches Steam with SDL restricted to the fused controller via `SDL_GAMECONTROLLER_IGNORE_DEVICES_EXCEPT`.
 
 Exit Steam completely before using this helper. The SDL controller filter only applies when this script starts the Steam client; if Steam is already running, the helper exits with an error instead of starting fusion and immediately cleaning it up.
 

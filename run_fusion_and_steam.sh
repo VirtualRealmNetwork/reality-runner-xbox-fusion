@@ -121,6 +121,7 @@ start_fusion() {
     --virtual-product "${VIRTUAL_PRODUCT}" \
     --virtual-name "${VIRTUAL_NAME}" \
     --grab both \
+    --steer-blend \
     "$@" >>"${FUSION_LOG}" 2>&1 &
   FUSION_PID=$!
 }

@@ -272,3 +272,131 @@ def summarize_devices(devices: list[DeviceSummary]) -> str:
     for device in devices:
         lines.append(device.label())
     return "\n".join(lines)
+
+
+def compute_geometry(
+    a_x: float,
+    a_y: float,
+    b_x: float,
+    b_y: float,
+    deadzone_a: float,
+    deadzone_b: float,
+    b_supports_backward: bool = False,
+) -> tuple[float, float, float, float, bool, bool, float, str]:
+    """Direction + per-source magnitudes for the steering blend.
+
+    Returns (ux, uy, magnitude_a, magnitude_b, a_active, b_backward, angle_radians,
+    angle_source). (ux, uy) is the unit output direction; the caller multiplies it by a
+    blended magnitude. Direction matches fuse_left_stick (Controller A angle when A is
+    active, else forward, with the Reality Runner v2 backward flip).
+    """
+    dz_a_x, dz_a_y, magnitude_a = radial_deadzone(a_x, a_y, deadzone_a)
+    _, dz_b_y, magnitude_b = radial_deadzone(b_x, b_y, deadzone_b)
+
+    a_active = magnitude_a > 0.0
+    b_backward = b_supports_backward and dz_b_y > 0.0
+    if a_active:
+        angle_radians = math.atan2(dz_a_y, dz_a_x)
+        if b_backward:
+            angle_radians += math.pi
+        ux = math.cos(angle_radians)
+        uy = math.sin(angle_radians)
+        angle_source = "controller_a_opposite" if b_backward else "controller_a"
+    else:
+        ux = 0.0
+        uy = 1.0 if b_backward else -1.0
+        angle_radians = math.pi / 2.0 if b_backward else -math.pi / 2.0
+        angle_source = "backward" if b_backward else "forward"
+    return ux, uy, magnitude_a, magnitude_b, a_active, b_backward, angle_radians, angle_source
+
+
+@dataclass
+class IntensityBlender:
+    """Blend Controller A's instant intensity with the treadmill's lagged intensity.
+
+    A is "engaged" via a Schmitt trigger on the raw stick magnitude: engage above
+    `on_threshold`, disengage below `off_threshold` (hysteresis). The engaged state is
+    then debounced: the *rising* edge fires immediately (fast start; seed 1 only if we
+    were idle, m_prev < eps_move, else 0 for steer-only), while the *falling* edge fires
+    only after the stick stays disengaged for `debounce` seconds. The low off-threshold
+    keeps the disengaged window tiny during a direction reversal, so the short debounce
+    bridges it without chopping output to 0; a real release (settling near center longer
+    than the debounce) still snaps output toward mag_A (== 0) for a fast stop.
+
+    Weight w holds at its seed for `hold` seconds then ramps linearly to 0 over `ramp`.
+    Output magnitude m = w * a + (1 - w) * b.
+    """
+
+    hold: float
+    ramp: float
+    eps_move: float
+    debounce: float = 0.06
+    on_threshold: float = 0.18
+    off_threshold: float = 0.10
+    w0: float = 0.0
+    since_edge: float = 1.0e9
+    m_prev: float = 0.0
+    engaged: bool = False
+    confirmed_active: bool = False
+    pending_off: float = 0.0
+
+    def reset(self) -> None:
+        self.w0 = 0.0
+        self.since_edge = 1.0e9
+        self.m_prev = 0.0
+        self.engaged = False
+        self.confirmed_active = False
+        self.pending_off = 0.0
+
+    def weight(self) -> float:
+        t = self.since_edge
+        if t < self.hold:
+            profile = 1.0
+        elif self.ramp > 0.0 and t < self.hold + self.ramp:
+            profile = 1.0 - (t - self.hold) / self.ramp
+        else:
+            profile = 0.0
+        return self.w0 * profile
+
+    def is_active(self) -> bool:
+        return (self.w0 > 0.0 and self.since_edge < self.hold + self.ramp) or self.pending_off > 0.0
+
+    def update(self, a: float, b: float, raw_mag_a: float, dt: float) -> float:
+        dt = dt if dt > 0.0 else 0.0
+
+        # Schmitt-trigger engagement on the raw stick magnitude (hysteresis).
+        if not self.engaged and raw_mag_a > self.on_threshold:
+            self.engaged = True
+        elif self.engaged and raw_mag_a <= self.off_threshold:
+            self.engaged = False
+
+        # Debounce the engaged state into confirmed_active and detect edges.
+        rising = False
+        falling = False
+        if self.engaged != self.confirmed_active:
+            if self.engaged:
+                self.confirmed_active = True   # rising: confirm immediately (fast start)
+                self.pending_off = 0.0
+                rising = True
+            else:
+                self.pending_off += dt         # falling: require `debounce` of disengagement
+                if self.pending_off >= self.debounce:
+                    self.confirmed_active = False
+                    self.pending_off = 0.0
+                    falling = True
+        else:
+            self.pending_off = 0.0
+
+        if rising:
+            self.w0 = 1.0 if self.m_prev < self.eps_move else 0.0
+            self.since_edge = 0.0
+        elif falling:
+            self.w0 = 1.0
+            self.since_edge = 0.0
+        else:
+            self.since_edge += dt
+
+        w = self.weight()
+        m = w * a + (1.0 - w) * b
+        self.m_prev = m
+        return m
