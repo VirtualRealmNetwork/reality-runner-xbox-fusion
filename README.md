@@ -412,3 +412,7 @@ If you want to inspect currently visible physical controllers again:
 ```bash
 ./controller_debug.py
 ```
+
+## License
+
+Licensed under the Apache License, Version 2.0. See [`LICENSE`](LICENSE) and [`NOTICE`](NOTICE).
